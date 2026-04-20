@@ -1,0 +1,93 @@
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project]
+name = "baca"
+version = "0.1.0"
+description = "BACA — Bootstrapped Advantage Critic Agent. Reinforcement learning agent for the Usiec Cepra deckbuilder."
+readme = "README.md"
+requires-python = "==3.14.*"
+license = {text = "MIT"}
+authors = [
+    {name = "Patryk Żmigrodzki", email = "patryk@zmigrodzki.dev"},
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "gymnasium>=1.0.0",
+    "numpy>=2.1.0",
+    "stable-baselines3>=2.4.0",
+    "sb3-contrib>=2.4.0",
+    "torch>=2.5.0",
+]
+
+[project.scripts]
+baca-train = "baca.train:main"
+baca-eval = "baca.eval_cli:main"
+
+[tool.pdm]
+package-dir = {"" = "src"}
+distribution = false
+
+[tool.pdm.dev-dependencies]
+lint = [
+    "mypy>=1.11.0",
+    "ruff>=0.7.0",
+    "diff-cover>=9.0.0",
+]
+
+[tool.pdm.scripts]
+test = "pytest"
+test-cov = "pytest --cov=src/baca --cov-report=term-missing --cov-report=html"
+lint = {shell = "ruff check . && mypy src/ tests/"}
+fmt = "ruff format ."
+check = {shell = "ruff format . && ruff check . && mypy src/ tests/ && pytest"}
+train = {cmd = "python -m baca.train", env = {PYTHONPATH = "src"}}
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "I", "N", "W", "UP",
+    "B", "S", "SIM", "RET", "PIE", "C4",
+    "PT", "RUF", "PERF", "DTZ",
+    "A", "ICN", "T20", "LOG", "ASYNC", "FLY",
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106", "S107", "S110", "DTZ001", "DTZ005"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+mypy_path = "src"
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = [
+    "stable_baselines3.*", "sb3_contrib.*", "gymnasium.*", "torch.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = "src"
+addopts = "-vv"
+testpaths = ["tests/unit", "tests/integration"]
+python_functions = "test_*"
+
+[dependency-groups]
+test = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+    "pytest-cov>=5.0.0",
+    "hypothesis>=6.112.0",
+]
