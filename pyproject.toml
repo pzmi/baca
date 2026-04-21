@@ -22,9 +22,11 @@ classifiers = [
 dependencies = [
     "gymnasium>=1.0.0",
     "numpy>=2.1.0",
+    "orjson>=3.10",
     "stable-baselines3>=2.4.0",
     "sb3-contrib>=2.4.0",
     "torch>=2.5.0",
+    "tensorboard>=2.18.0",
 ]
 
 [project.scripts]
@@ -43,12 +45,13 @@ lint = [
 ]
 
 [tool.pdm.scripts]
+_.env = {PYTHONPATH = "src"}
 test = "pytest"
 test-cov = "pytest --cov=src/baca --cov-report=term-missing --cov-report=html"
 lint = {shell = "ruff check . && mypy src/ tests/"}
 fmt = "ruff format ."
 check = {shell = "ruff format . && ruff check . && mypy src/ tests/ && pytest"}
-train = {cmd = "python -m baca.train", env = {PYTHONPATH = "src"}}
+train = "python -m baca.train"
 
 [tool.ruff]
 line-length = 100
@@ -64,7 +67,7 @@ select = [
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "S105", "S106", "S107", "S110", "DTZ001", "DTZ005"]
+"tests/**/*.py" = ["S101", "S105", "S106", "S107", "S110", "S311", "DTZ001", "DTZ005", "N802"]
 
 [tool.mypy]
 python_version = "3.14"

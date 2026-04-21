@@ -40,12 +40,20 @@ PLAYER_STATUSES: tuple[str, ...] = (
     "next_double",
 )
 
+# O(1) lookup dicts mirroring the tuples above. Must stay in sync; append-only
+# semantics on the tuples carry over here.
+_PHASE_INDEX: dict[str, int] = {name: i for i, name in enumerate(PHASES)}
+_CARD_TYPE_INDEX: dict[str, int] = {name: i for i, name in enumerate(CARD_TYPES)}
+_PLAYER_STATUS_INDEX: dict[str, int] = {name: i for i, name in enumerate(PLAYER_STATUSES)}
+
 
 def observation_space() -> spaces.Dict:
     """Gymnasium observation space matching :func:`encode` output."""
     return spaces.Dict(
         {
-            "player": spaces.Box(low=-1.0, high=1.0, shape=(4 + len(PLAYER_STATUSES),), dtype=np.float32),
+            "player": spaces.Box(
+                low=-1.0, high=1.0, shape=(4 + len(PLAYER_STATUSES),), dtype=np.float32
+            ),
             "enemy": spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32),
             "enemy_present": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "phase": spaces.Box(low=0.0, high=1.0, shape=(len(PHASES),), dtype=np.float32),
@@ -109,8 +117,9 @@ def _encode_enemy(enemy: dict[str, Any] | None, player_max_hp: int) -> np.ndarra
 
 def _encode_phase(phase: str) -> np.ndarray:
     out = np.zeros(len(PHASES), dtype=np.float32)
-    if phase in PHASES:
-        out[PHASES.index(phase)] = 1.0
+    idx = _PHASE_INDEX.get(phase, -1)
+    if idx >= 0:
+        out[idx] = 1.0
     return out
 
 
@@ -134,8 +143,9 @@ def _encode_hand(hand: list[dict[str, Any]]) -> np.ndarray:
         out[i, 0] = cost
         out[i, 1] = 0.0 if card.get("unplayable") else 1.0
         card_type = card.get("type")
-        if card_type in CARD_TYPES:
-            out[i, 2 + CARD_TYPES.index(card_type)] = 1.0
+        card_type_idx = _CARD_TYPE_INDEX.get(card_type, -1) if isinstance(card_type, str) else -1
+        if card_type_idx >= 0:
+            out[i, 2 + card_type_idx] = 1.0
     return out
 
 
@@ -156,17 +166,17 @@ def _status_magnitude(status: dict[str, Any], key: str) -> float:
     if entry is None:
         return 0.0
     if isinstance(entry, dict):
-        amount = entry.get("amount", entry.get("value", entry.get("duration", 0)))
+        amount = entry.get("amount", entry.get("value", entry.get("duration", 0))) or 0
         return min(1.0, float(amount) / 5.0)
     if isinstance(entry, (int, float, bool)):
         return min(1.0, float(entry) / 5.0)
     return 0.0
 
 
-def _normalize_cost(cost: Any) -> float:  # noqa: ANN401 — engine uses mixed types
+def _normalize_cost(cost: Any) -> float:
     if cost == "X" or cost == -1:
         return 1.0
     try:
         return min(1.0, max(0.0, float(cost) / 3.0))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0.0

@@ -4,17 +4,69 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
+import time
 from pathlib import Path
+from typing import Any, cast
 
+import numpy as np
+from gymnasium import Env
 from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.evaluation import evaluate_policy
 from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.monitor import Monitor
 
 from baca.env import UsiecCepraEnv
 from baca.rpc_client import RpcClient
 
 
-def _mask_fn(env: UsiecCepraEnv) -> "np.ndarray":  # type: ignore[name-defined]
-    return env.action_masks()
+def _mask_fn(env: Env[Any, Any]) -> np.ndarray:
+    return cast(UsiecCepraEnv, env).action_masks()
+
+
+class EpisodeCollector:
+    """Per-step callback for ``evaluate_policy`` that records terminal info.
+
+    ``evaluate_policy`` passes ``locals()`` which exposes ``done`` and ``info``
+    from the current vectorized step. On episode end we harvest ``outcome`` and
+    ``summary.floorReached`` that :class:`UsiecCepraEnv` attaches in ``info``.
+    """
+
+    def __init__(self, total: int, report_every: int = 10) -> None:
+        self.floors: list[int] = []
+        self.wins: list[int] = []
+        self.total = total
+        self.report_every = max(1, report_every)
+        self._start = time.monotonic()
+
+    def __call__(self, locals_dict: dict[str, Any], _globals_dict: dict[str, Any]) -> None:
+        if not locals_dict.get("done"):
+            return
+        info = locals_dict.get("info") or {}
+        summary = info.get("summary") or {}
+        self.floors.append(int(summary.get("floorReached", 0)))
+        self.wins.append(1 if info.get("outcome") == "player_win" else 0)
+        n = len(self.wins)
+        if n % self.report_every == 0 or n == self.total:
+            elapsed = time.monotonic() - self._start
+            wr = sum(self.wins) / n
+            avg_fl = statistics.fmean(self.floors)
+            print(  # noqa: T201 — CLI progress
+                f"[eval] {n}/{self.total}  winrate={wr:.3f}  avg_floor={avg_fl:.2f}  "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+                file=sys.stderr,
+            )
+
+
+def _aggregate(episodes: int, floors: list[int], wins: list[int]) -> dict[str, float]:
+    finished = len(wins)
+    return {
+        "episodes": float(episodes),
+        "winrate": (sum(wins) / finished) if finished else 0.0,
+        "avg_floor": statistics.fmean(floors) if floors else 0.0,
+        "max_floor": float(max(floors)) if floors else 0.0,
+    }
 
 
 def evaluate(
@@ -25,9 +77,8 @@ def evaluate(
     base_seed: int | None,
     engine_dir: Path | None,
 ) -> dict[str, float]:
+    collector = EpisodeCollector(total=episodes)
     rpc = RpcClient(engine_dir=engine_dir)
-    wins = 0
-    floors: list[int] = []
     try:
         raw_env = UsiecCepraEnv(
             rpc,
@@ -35,29 +86,20 @@ def evaluate(
             difficulty=difficulty,
             base_seed=base_seed,
         )
-        env = ActionMasker(raw_env, _mask_fn)
+        env: Monitor[Any, Any] = Monitor(ActionMasker(raw_env, _mask_fn))
         model = MaskablePPO.load(str(checkpoint), env=env)
-        for _ in range(episodes):
-            obs, _info = env.reset()
-            done = False
-            while not done:
-                mask = raw_env.action_masks()
-                action, _ = model.predict(obs, action_masks=mask, deterministic=True)
-                obs, _reward, terminated, truncated, info = env.step(int(action))
-                done = terminated or truncated
-            summary = (info or {}).get("summary") or {}
-            if (info or {}).get("outcome") == "player_win":
-                wins += 1
-            floors.append(int(summary.get("floorReached", 0)))
+        evaluate_policy(
+            model,
+            env,
+            n_eval_episodes=episodes,
+            deterministic=True,
+            use_masking=True,
+            callback=collector,
+        )
         env.close()
     finally:
         rpc.close()
-    return {
-        "episodes": float(episodes),
-        "winrate": wins / max(episodes, 1),
-        "avg_floor": statistics.fmean(floors) if floors else 0.0,
-        "max_floor": float(max(floors)) if floors else 0.0,
-    }
+    return _aggregate(episodes, collector.floors, collector.wins)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 
 from baca.encoder import (
+    _CARD_TYPE_INDEX,
+    _PHASE_INDEX,
+    _PLAYER_STATUS_INDEX,
     CARD_TYPES,
     MAX_ACTIONS,
     MAX_HAND_SIZE,
@@ -165,3 +168,66 @@ def test_shouldPadHandWhenSmallerThanMaxSize() -> None:
     # Playable attack card: playable=1, one-hot attack
     assert encoded["hand"][0, 1] == 1.0
     assert encoded["hand"][0, 2 + CARD_TYPES.index("attack")] == 1.0
+
+
+def test_shouldReturnCorrectIndexWhenPhaseKnown() -> None:
+    # given
+    phases = PHASES
+
+    # when / then
+    for i, phase in enumerate(phases):
+        assert _PHASE_INDEX[phase] == i
+        assert _PHASE_INDEX[phase] == PHASES.index(phase)
+    assert len(_PHASE_INDEX) == len(PHASES)
+
+
+def test_shouldReturnCorrectIndexWhenCardTypeKnown() -> None:
+    # given
+    types = CARD_TYPES
+
+    # when / then
+    for i, card_type in enumerate(types):
+        assert _CARD_TYPE_INDEX[card_type] == i
+        assert _CARD_TYPE_INDEX[card_type] == CARD_TYPES.index(card_type)
+    assert len(_CARD_TYPE_INDEX) == len(CARD_TYPES)
+
+
+def test_shouldReturnCorrectIndexWhenPlayerStatusKnown() -> None:
+    # given
+    statuses = PLAYER_STATUSES
+
+    # when / then
+    for i, status in enumerate(statuses):
+        assert _PLAYER_STATUS_INDEX[status] == i
+        assert _PLAYER_STATUS_INDEX[status] == PLAYER_STATUSES.index(status)
+    assert len(_PLAYER_STATUS_INDEX) == len(PLAYER_STATUSES)
+
+
+def test_shouldReturnMinusOneWhenPhaseUnknown() -> None:
+    # given
+    unknown_phase = "not_a_real_phase"
+
+    # when
+    idx = _PHASE_INDEX.get(unknown_phase, -1)
+
+    # then
+    assert idx == -1
+
+
+def test_shouldProduceIndependentOutputsWhenEncodedConsecutively() -> None:
+    # given
+    obs_a = _minimal_observation()
+    obs_b = _minimal_observation()
+    obs_b["phase"] = "shop"
+    obs_b["enemy"] = None
+
+    # when
+    encoded_a_first = encode(obs_a)
+    encoded_b = encode(obs_b)
+    encoded_a_second = encode(obs_a)
+
+    # then — encoding obs_b must not mutate the arrays previously returned for obs_a
+    for key in encoded_a_first:
+        np.testing.assert_array_equal(encoded_a_first[key], encoded_a_second[key])
+    assert encoded_b["enemy_present"][0] == 0.0
+    assert encoded_a_first["enemy_present"][0] == 1.0
