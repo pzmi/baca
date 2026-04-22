@@ -162,3 +162,16 @@ Eval against HeuristicBot baseline (9998 games, 3.56% winrate, 10.23 avg_floor):
 2.0% on n=200 is within the ~±1.3% 95%-CI half-width of the plan's `[2.56%, 4.56%]` acceptance band; avg_floor trails HeuristicBot by ~2 floors. Plan §1 red regression (winrate < 1% AND avg_floor < 5) is not tripped. The 2-floor gap indicates that BC's mis-imitated decisions concentrate at late-game (higher-floor) states where suboptimal actions kill runs faster — consistent with the imitation ceiling leaving room for PPO fine-tune to recover.
 
 Full log at `logs/step6.out`; checkpoint at `checkpoints/v3-bc/bc_model.zip`.
+
+### Step 7: value-head pretrain on BC dataset
+
+`python -m baca.bc.value_pretrain_cli --bc-checkpoint checkpoints/v3-bc/bc_model.zip --data data/v3 --out checkpoints/v3-bc-value/bc_value_model.zip --gamma 0.99 --n-epochs 2 --batch-size 256 --lr 1e-3` — 3m39s on CPU.
+
+| Epoch | train_loss | pred_mean | pred_std | returns_mean | returns_std |
+|:------|:-----------|:----------|:---------|:-------------|:------------|
+| 1     | 0.00372    | 0.0042    | 0.0353   | 0.0041       | 0.0516      |
+| 2     | 0.00285    | 0.0041    | 0.0167   | 0.0041       | 0.0516      |
+
+`pred_mean ≈ returns_mean` — the critic is well-calibrated in expectation. `pred_std < returns_std` (0.017 vs 0.052 after epoch 2) means the value function smooths toward the mean return and does not yet discriminate states; this is the expected regime when ~99.5% of the terminal rewards are near-zero (2% winrate on a 3.2M-sample dataset). Good enough as a PPO bootstrap — plan §5 Step 8's `--initial-lr-scale 0.33 --clip-range 0.1` guards the first 20k-30k on-policy steps while the critic learns to discriminate from live rollouts.
+
+Checkpoint at `checkpoints/v3-bc-value/bc_value_model.zip`, full log at `logs/step7_value_pretrain.out`.
