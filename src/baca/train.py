@@ -27,6 +27,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 
 from baca.env import UsiecCepraEnv
+from baca.policy import MaskableBacaPolicy
 from baca.rpc_client import RpcClient
 
 
@@ -43,7 +44,7 @@ class TrainConfig:
     batch_size: int
     ent_coef: float = 0.01
     n_epochs: int = 10
-    gamma: float = 0.995
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     lr_final: float = 1e-4
@@ -52,6 +53,9 @@ class TrainConfig:
     checkpoint_freq: int = 20_000
     seed: int = 42
     n_envs: int = 8
+    reward_shape: str = "floor"
+    card_embed_dim: int = 32
+    features_dim: int = 64
 
 
 def _linear_schedule(start: float, end: float) -> Callable[[float], float]:
@@ -70,6 +74,7 @@ def make_env(
     difficulty: str,
     base_seed: int | None,
     engine_dir: Path | None,
+    reward_shape: str = "none",
 ) -> Callable[[], gymnasium.Env[Any, Any]]:
     """Build a picklable thunk that a worker calls to construct its own env.
 
@@ -80,6 +85,11 @@ def make_env(
     """
 
     worker_seed = None if base_seed is None else base_seed + rank * 1_000_000
+    # Cast once, here, so the literal survives the pickle boundary to subproc
+    # workers and the worker-side import from baca.env typechecks.
+    from baca.env import RewardShape  # imported lazily to avoid cycle surprises
+
+    shape_literal: RewardShape = "floor" if reward_shape == "floor" else "none"
 
     def _thunk() -> gymnasium.Env[Any, Any]:
         rpc = RpcClient(engine_dir=engine_dir)
@@ -88,6 +98,7 @@ def make_env(
             character_id=character_id,
             difficulty=difficulty,
             base_seed=worker_seed,
+            reward_shape=shape_literal,
         )
         return Monitor(env)
 
@@ -103,6 +114,7 @@ def _build_train_vec_env(cfg: TrainConfig) -> VecEnv:
             difficulty=cfg.difficulty,
             base_seed=train_seed,
             engine_dir=cfg.engine_dir,
+            reward_shape=cfg.reward_shape,
         )
         for i in range(cfg.n_envs)
     ]
@@ -119,6 +131,7 @@ def _build_eval_vec_env(cfg: TrainConfig) -> VecEnv:
         difficulty=cfg.difficulty,
         base_seed=train_seed + 10_000,
         engine_dir=cfg.engine_dir,
+        reward_shape=cfg.reward_shape,
     )
     return DummyVecEnv([eval_thunk])
 
@@ -130,8 +143,12 @@ def train(cfg: TrainConfig) -> Path:
     try:
         eval_env = _build_eval_vec_env(cfg)
 
+        policy_kwargs: dict[str, Any] = {
+            "card_embed_dim": cfg.card_embed_dim,
+            "features_dim": cfg.features_dim,
+        }
         model = MaskablePPO(
-            "MultiInputPolicy",
+            MaskableBacaPolicy,
             train_env,
             learning_rate=_linear_schedule(cfg.learning_rate, cfg.lr_final),
             n_steps=cfg.n_steps,
@@ -144,6 +161,7 @@ def train(cfg: TrainConfig) -> Path:
             seed=cfg.seed,
             verbose=1,
             tensorboard_log=str(cfg.checkpoint_dir / "tensorboard"),
+            policy_kwargs=policy_kwargs,
         )
 
         eval_cb = MaskableEvalCallback(
@@ -185,7 +203,7 @@ def _parse_args(argv: list[str] | None = None) -> TrainConfig:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--n-epochs", type=int, default=10)
-    parser.add_argument("--gamma", type=float, default=0.995)
+    parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-range", type=float, default=0.2)
     parser.add_argument("--lr-final", type=float, default=1e-4)
@@ -199,6 +217,15 @@ def _parse_args(argv: list[str] | None = None) -> TrainConfig:
         default=8,
         help="Parallel training envs. Each worker owns one RpcClient (and one Node subprocess).",
     )
+    parser.add_argument(
+        "--reward-shape",
+        type=str,
+        default="floor",
+        choices=["none", "floor"],
+        help="Terminal reward shaping. 'floor' = 0.1*(floor/15) + 0.9*is_win; 'none' = v0 pure win signal.",
+    )
+    parser.add_argument("--card-embed-dim", type=int, default=32)
+    parser.add_argument("--features-dim", type=int, default=64)
     args = parser.parse_args(argv)
     return TrainConfig(
         total_timesteps=args.total_timesteps,
@@ -221,6 +248,9 @@ def _parse_args(argv: list[str] | None = None) -> TrainConfig:
         checkpoint_freq=args.checkpoint_freq,
         seed=args.seed,
         n_envs=args.n_envs,
+        reward_shape=args.reward_shape,
+        card_embed_dim=args.card_embed_dim,
+        features_dim=args.features_dim,
     )
 
 

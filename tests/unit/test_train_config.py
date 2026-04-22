@@ -57,7 +57,7 @@ def test_shouldExposeSparseRewardDefaultsWhenConfigConstructedWithoutOverrides()
     # when / then
     assert cfg.ent_coef == 0.01
     assert cfg.n_epochs == 10
-    assert cfg.gamma == 0.995
+    assert cfg.gamma == 0.99
     assert cfg.gae_lambda == 0.95
     assert cfg.clip_range == 0.2
     assert cfg.lr_final == 1e-4
@@ -66,6 +66,9 @@ def test_shouldExposeSparseRewardDefaultsWhenConfigConstructedWithoutOverrides()
     assert cfg.checkpoint_freq == 20_000
     assert cfg.seed == 42
     assert cfg.n_envs == 8
+    assert cfg.reward_shape == "floor"
+    assert cfg.card_embed_dim == 32
+    assert cfg.features_dim == 64
 
 
 def test_shouldParseTrainingArgsWhenAllFlagsProvided() -> None:
@@ -149,3 +152,62 @@ def test_shouldDefaultEngineDirToNoneWhenFlagOmitted() -> None:
     assert cfg.base_seed is None
     assert cfg.learning_rate == 3e-4
     assert cfg.lr_final == 1e-4
+
+
+def test_shouldDefaultGammaToNineNineWhenConfigConstructedWithoutOverrides() -> None:
+    # given
+    cfg = TrainConfig(
+        total_timesteps=1,
+        character_id="jedrek",
+        difficulty="normal",
+        base_seed=None,
+        checkpoint_dir=Path("checkpoints"),
+        engine_dir=None,
+        learning_rate=3e-4,
+        n_steps=512,
+        batch_size=64,
+    )
+
+    # when / then
+    assert cfg.gamma == 0.99
+
+
+def test_shouldDefaultRewardShapeToFloorWhenConfigConstructedWithoutOverrides() -> None:
+    # given
+    cfg = TrainConfig(
+        total_timesteps=1,
+        character_id="jedrek",
+        difficulty="normal",
+        base_seed=None,
+        checkpoint_dir=Path("checkpoints"),
+        engine_dir=None,
+        learning_rate=3e-4,
+        n_steps=512,
+        batch_size=64,
+    )
+
+    # when / then
+    assert cfg.reward_shape == "floor"
+
+
+def test_shouldParseRewardShapeChoiceWhenFlagProvided() -> None:
+    # given
+    argv = ["--reward-shape", "none"]
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.reward_shape == "none"
+
+
+def test_shouldParseCardEmbedDimWhenFlagProvided() -> None:
+    # given
+    argv = ["--card-embed-dim", "48", "--features-dim", "96"]
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.card_embed_dim == 48
+    assert cfg.features_dim == 96

@@ -51,9 +51,9 @@ Module responsibilities (`src/baca/`):
 
 - **Engine `RUN_CAP = 16`** per Node process. One `RpcClient` owns one subprocess; for >16 concurrent envs (e.g. `SubprocVecEnv`), spawn multiple clients and round-robin run creation.
 - **Action space is fixed** `Discrete(MAX_ACTIONS=32)`; index `i` maps to `observation.legalActions[i]`. Out-of-mask indices are clamped to `0` in `env.step` as a defensive fallback — if you change the mask wiring, revisit that clamp.
-- **Checkpoint stability.** `PHASES`, `CARD_TYPES`, `PLAYER_STATUSES` in `encoder.py` are ordered tuples; any new entry must be **appended**, never inserted, or saved policies break.
-- **No card-identity embedding** in v0 (type + cost only). Same-type/cost cards are indistinguishable to the policy — expected, deferred to phase 2 per `doc/roadmap.md`.
-- **Reward is terminal-only** (`+1` on `player_win`, else `0`). Baseline HeuristicBot winrate is 3.56%, so ~96% of episodes carry zero signal. Don't add per-step shaping without updating `doc/ml-approach.md`.
+- **Checkpoint stability.** `PHASES`, `CARD_TYPES`, `PLAYER_STATUSES`, and `CARD_IDS` in `encoder.py` are ordered tuples; any new entry must be **appended**, never inserted, or saved policies break. `CARD_IDS[0]` is the reserved `UNKNOWN` sentinel that absorbs engine cards not yet registered in the tuple.
+- **Card-identity embedding** (iter-2, `src/baca/policy.py`). `BacaFeaturesExtractor` shares an `nn.Embedding(CARD_VOCAB_SIZE, card_embed_dim)` across hand / shop / reward blocks and attention-pools each block under its mask. Policy class is `MaskableBacaPolicy`.
+- **Reward defaults to floor-shaped** (`--reward-shape floor`): `0.1*(floor/15) + 0.9*is_win` at termination, `0` on truncation. The pure-win signal is still available via `--reward-shape none`, but a 200k-step A/B on the current encoder (fixed init + no final ReLU) shows its value function collapses (`explained_variance` -12 to -34) under sparse terminal reward, whereas floor shaping keeps it healthy (+0.2 to +0.6) and lifts eval avg_floor from 2.01 (shape=none) to 7.01 (shape=floor). Don't add per-step shaping without updating `doc/ml-approach.md`.
 - **Seeds.** `(characterId, seed)` reproduces a run. `env.reset(seed=...)` beats `base_seed`; `base_seed` is incremented per episode (`base_seed + episode_counter`) for variety.
 - **RPC client is synchronous but threaded.** A reader thread demuxes responses by request `id`; notifications (from `engine.subscribe`) land in `drain_notifications()`. `dispose` failures are intentionally swallowed in `env.reset/close` — they are best-effort cleanup.
 
@@ -61,5 +61,6 @@ Module responsibilities (`src/baca/`):
 
 - **Test names:** `test_shouldResultWhenCondition` (camelCase after the `test_` prefix), with `# given` / `# when` / `# then` section comments. See `tests/integration/test_smoke.py`.
 - **Python 3.14**, `ruff` line length 100, `mypy --strict`. Tests waive `S101`, `S105-7`, `S110`, `DTZ001`, `DTZ005` (see `pyproject.toml`).
+- **Python 3.14 `except` syntax:** `except A, B:` (no parens) is valid and equivalent to `except (A, B):` — do NOT flag it as a Python 2 artifact. Confirmed via `ast.parse` and runtime in Python 3.14.3.
 - **CLI `print` is allowed** via `# noqa: T201` on the specific line — do not disable `T20` globally.
 - **Engine is the source of truth** for observation shape and action unions. If the engine's `Observation.js` or `ActionDispatcher.js` changes, update `doc/observation-action.md` and the encoder in the same commit.

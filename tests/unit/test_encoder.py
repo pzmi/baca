@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import os
+import re
+from pathlib import Path
+
 import numpy as np
+import pytest
 
 from baca.encoder import (
+    _CARD_ID_INDEX,
     _CARD_TYPE_INDEX,
     _PHASE_INDEX,
     _PLAYER_STATUS_INDEX,
+    CARD_IDS,
     CARD_TYPES,
+    CARD_VOCAB_SIZE,
     MAX_ACTIONS,
     MAX_HAND_SIZE,
+    MAX_REWARD_CARDS,
+    MAX_SHOP_CARDS,
     PHASES,
     PLAYER_STATUSES,
     encode,
@@ -212,6 +222,173 @@ def test_shouldReturnMinusOneWhenPhaseUnknown() -> None:
 
     # then
     assert idx == -1
+
+
+def test_shouldIncludeUnknownSentinelWhenCardIdsInitialized() -> None:
+    # given / when
+    sentinel_index = _CARD_ID_INDEX["UNKNOWN"]
+
+    # then
+    assert CARD_IDS[0] == "UNKNOWN"
+    assert sentinel_index == 0
+    assert len(CARD_IDS) == CARD_VOCAB_SIZE
+    assert len(set(CARD_IDS)) == len(CARD_IDS), "CARD_IDS must be unique"
+
+
+def _engine_cards_path() -> Path | None:
+    override = os.environ.get("BACA_ENGINE_DIR")
+    if override:
+        base = Path(override)
+    else:
+        base = Path(__file__).resolve().parent.parent.parent.parent / "slay-the-ceper"
+    candidate = (base / "src" / "data" / "cards.js").resolve()
+    return candidate if candidate.is_file() else None
+
+
+@pytest.mark.skipif(_engine_cards_path() is None, reason="engine cards.js not found")
+def test_shouldMatchEngineCardsFileWhenAuditCompared() -> None:
+    # given
+    cards_path = _engine_cards_path()
+    assert cards_path is not None
+    source = cards_path.read_text(encoding="utf-8")
+
+    # when
+    engine_ids = re.findall(r"^\s*id:\s*'([^']+)'", source, flags=re.MULTILINE)
+
+    # then
+    expected = ("UNKNOWN", *engine_ids)
+    assert expected == CARD_IDS, (
+        "CARD_IDS drifted from engine's cards.js. Append new engine ids to the "
+        "tail of CARD_IDS; never insert or reorder (breaks saved checkpoints)."
+    )
+
+
+def test_shouldReturnCorrectIndexWhenCardIdKnown() -> None:
+    # given
+    ids = CARD_IDS
+
+    # when / then
+    for i, card_id in enumerate(ids):
+        assert _CARD_ID_INDEX[card_id] == i
+    assert len(_CARD_ID_INDEX) == len(CARD_IDS)
+
+
+def test_shouldProduceHandIdsMatchingHandWhenCardsPresent() -> None:
+    # given
+    obs = _minimal_observation()
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    assert encoded["hand_ids"].shape == (MAX_HAND_SIZE,)
+    assert encoded["hand_ids"].dtype == np.int64
+    assert encoded["hand_ids"][0] == _CARD_ID_INDEX["ciupaga"]
+    # "garda" is not in CARD_IDS so should map to UNKNOWN sentinel at index 0
+    assert encoded["hand_ids"][1] == 0
+    assert encoded["hand_ids"][2] == 0  # padding
+
+
+def test_shouldZeroFillRewardIdsWhenPhaseNotReward() -> None:
+    # given
+    obs = _minimal_observation()  # phase is "battle"
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    assert encoded["reward_ids"].shape == (MAX_REWARD_CARDS,)
+    assert encoded["reward_mask"].shape == (MAX_REWARD_CARDS,)
+    assert encoded["reward_costs"].shape == (MAX_REWARD_CARDS,)
+    assert np.all(encoded["reward_ids"] == 0)
+    assert np.all(encoded["reward_mask"] == 0)
+    assert np.all(encoded["reward_costs"] == 0.0)
+
+
+def test_shouldEncodeRewardCardIdsWhenOfferPresent() -> None:
+    # given
+    obs = _minimal_observation()
+    obs["phase"] = "reward"
+    obs["enemy"] = None
+    obs["rewardOffer"] = {"cards": ["ciupaga", "janosik"], "relicId": "bilet_tpn"}
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    assert encoded["reward_ids"][0] == _CARD_ID_INDEX["ciupaga"]
+    assert encoded["reward_ids"][1] == _CARD_ID_INDEX["janosik"]
+    assert encoded["reward_ids"][2] == 0
+    assert encoded["reward_mask"][0] == 1
+    assert encoded["reward_mask"][1] == 1
+    assert encoded["reward_mask"][2] == 0
+
+
+def test_shouldEncodeShopCardIdsWhenStockPresent() -> None:
+    # given
+    obs = _minimal_observation()
+    obs["phase"] = "shop"
+    obs["enemy"] = None
+    obs["shopStock"] = {"cards": ["giewont", "sandaly", "echo"], "relic": None}
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    assert encoded["shop_ids"].shape == (MAX_SHOP_CARDS,)
+    assert encoded["shop_ids"][0] == _CARD_ID_INDEX["giewont"]
+    assert encoded["shop_ids"][1] == _CARD_ID_INDEX["sandaly"]
+    assert encoded["shop_ids"][2] == _CARD_ID_INDEX["echo"]
+    assert np.all(encoded["shop_mask"] == 1)
+
+
+def test_shouldMapUnknownCardToIndexZeroWhenIdMissing() -> None:
+    # given
+    obs = _minimal_observation()
+    obs["phase"] = "reward"
+    obs["enemy"] = None
+    obs["rewardOffer"] = {"cards": ["card_not_in_registry"], "relicId": None}
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    assert encoded["reward_ids"][0] == 0  # UNKNOWN sentinel
+    assert encoded["reward_mask"][0] == 1
+
+
+def test_shouldRespectObservationSpaceDtypesWhenEncodingMixedFeatures() -> None:
+    # given
+    obs = _minimal_observation()
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    assert encoded["hand_ids"].dtype == np.int64
+    assert encoded["reward_ids"].dtype == np.int64
+    assert encoded["shop_ids"].dtype == np.int64
+    assert encoded["player"].dtype == np.float32
+    assert encoded["hand"].dtype == np.float32
+    assert encoded["reward_costs"].dtype == np.float32
+    assert encoded["shop_costs"].dtype == np.float32
+
+
+def test_shouldMatchObservationSpaceWhenAllNewKeysPresent() -> None:
+    # given
+    obs = _minimal_observation()
+    obs["phase"] = "shop"
+    obs["enemy"] = None
+    obs["shopStock"] = {"cards": ["giewont", "sandaly"], "relic": "bilet_tpn"}
+
+    # when
+    encoded = encode(obs)
+
+    # then
+    space = observation_space()
+    assert set(space.spaces.keys()) == set(encoded.keys())
+    for key, sub_space in space.spaces.items():
+        assert encoded[key].shape == sub_space.shape, f"shape mismatch for {key}"
 
 
 def test_shouldProduceIndependentOutputsWhenEncodedConsecutively() -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from baca.env import UsiecCepraEnv
 
 
@@ -79,6 +81,133 @@ def test_shouldPreferInlineSummaryWhenTerminalResultHasIt() -> None:
     assert info["summary"] == inline_summary
     methods = [call.args[0] for call in rpc.call.call_args_list]
     assert "engine.getRunSummary" not in methods
+
+
+def test_shouldReturnOneWhenWinWithNoShaping() -> None:
+    # given
+    rpc = MagicMock()
+    start_obs = _stub_observation(legal_actions=[{"type": "end_turn"}])
+    done_obs = {**start_obs, "done": True, "outcome": "player_win", "floor": 15}
+    rpc.call.side_effect = [
+        {"runId": "r"},
+        {"observation": start_obs},
+        {"observation": done_obs, "summary": {}},
+    ]
+    env = UsiecCepraEnv(rpc, reward_shape="none")
+    env.reset(seed=1)
+
+    # when
+    _obs, reward, done, _truncated, _info = env.step(0)
+
+    # then
+    assert done is True
+    assert reward == 1.0
+
+
+def test_shouldReturnOneWhenWinAtFloorFifteenWithFloorShaping() -> None:
+    # given
+    rpc = MagicMock()
+    start_obs = _stub_observation(legal_actions=[{"type": "end_turn"}])
+    done_obs = {**start_obs, "done": True, "outcome": "player_win", "floor": 15}
+    rpc.call.side_effect = [
+        {"runId": "r"},
+        {"observation": start_obs},
+        {"observation": done_obs, "summary": {}},
+    ]
+    env = UsiecCepraEnv(rpc, reward_shape="floor")
+    env.reset(seed=1)
+
+    # when
+    _obs, reward, done, _truncated, _info = env.step(0)
+
+    # then
+    assert done is True
+    assert reward == pytest.approx(1.0)
+
+
+def test_shouldReturnTenHundredthsWhenLossAtFloorFifteenWithFloorShaping() -> None:
+    # given
+    rpc = MagicMock()
+    start_obs = _stub_observation(legal_actions=[{"type": "end_turn"}])
+    done_obs = {**start_obs, "done": True, "outcome": "enemy_win", "floor": 15}
+    rpc.call.side_effect = [
+        {"runId": "r"},
+        {"observation": start_obs},
+        {"observation": done_obs, "summary": {}},
+    ]
+    env = UsiecCepraEnv(rpc, reward_shape="floor")
+    env.reset(seed=1)
+
+    # when
+    _obs, reward, done, _truncated, _info = env.step(0)
+
+    # then
+    assert done is True
+    assert reward == pytest.approx(0.1)
+
+
+def test_shouldScaleShapedRewardProportionallyWhenLossAtPartialFloor() -> None:
+    # given
+    rpc = MagicMock()
+    start_obs = _stub_observation(legal_actions=[{"type": "end_turn"}])
+    done_obs = {**start_obs, "done": True, "outcome": "enemy_win", "floor": 6}
+    rpc.call.side_effect = [
+        {"runId": "r"},
+        {"observation": start_obs},
+        {"observation": done_obs, "summary": {}},
+    ]
+    env = UsiecCepraEnv(rpc, reward_shape="floor")
+    env.reset(seed=1)
+
+    # when
+    _obs, reward, _done, _truncated, _info = env.step(0)
+
+    # then
+    assert reward == pytest.approx(0.1 * (6 / 15))
+
+
+def test_shouldReturnZeroWhenTruncatedRegardlessOfShaping() -> None:
+    # given
+    rpc = MagicMock()
+    start_obs = _stub_observation(legal_actions=[{"type": "end_turn"}])
+    # Not done, no outcome — step returns reward 0 and (if step_count exceeds
+    # max) truncated True.
+    continued_obs = {**start_obs, "done": False}
+    rpc.call.side_effect = [
+        {"runId": "r"},
+        {"observation": start_obs},
+        {"observation": continued_obs},
+    ]
+    env = UsiecCepraEnv(rpc, reward_shape="floor", max_episode_steps=1)
+    env.reset(seed=1)
+
+    # when
+    _obs, reward, done, truncated, _info = env.step(0)
+
+    # then
+    assert done is False
+    assert truncated is True
+    assert reward == 0.0
+
+
+def test_shouldIgnoreShapingWhenRewardShapeNone() -> None:
+    # given
+    rpc = MagicMock()
+    start_obs = _stub_observation(legal_actions=[{"type": "end_turn"}])
+    done_obs = {**start_obs, "done": True, "outcome": "enemy_win", "floor": 12}
+    rpc.call.side_effect = [
+        {"runId": "r"},
+        {"observation": start_obs},
+        {"observation": done_obs, "summary": {}},
+    ]
+    env = UsiecCepraEnv(rpc, reward_shape="none")
+    env.reset(seed=1)
+
+    # when
+    _obs, reward, _done, _truncated, _info = env.step(0)
+
+    # then
+    assert reward == 0.0
 
 
 def test_shouldFallBackToGetRunSummaryWhenInlineSummaryMissing() -> None:

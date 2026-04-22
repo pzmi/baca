@@ -7,7 +7,7 @@ the old run and creates a new one so subsequent episodes are independent.
 from __future__ import annotations
 
 import contextlib
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from gymnasium import Env, spaces
@@ -16,6 +16,7 @@ from baca.encoder import MAX_ACTIONS, encode, observation_space
 from baca.rpc_client import RpcClient
 
 EngineObservation = dict[str, Any]
+RewardShape = Literal["none", "floor"]
 
 
 class UsiecCepraEnv(Env[dict[str, np.ndarray], int]):
@@ -32,6 +33,7 @@ class UsiecCepraEnv(Env[dict[str, np.ndarray], int]):
         reveal_all_piles: bool = False,
         base_seed: int | None = None,
         max_episode_steps: int = 1000,
+        reward_shape: RewardShape = "none",
     ) -> None:
         super().__init__()
         self._rpc = rpc
@@ -42,6 +44,7 @@ class UsiecCepraEnv(Env[dict[str, np.ndarray], int]):
         self._episode_counter = 0
         self._base_seed = base_seed
         self._max_episode_steps = max_episode_steps
+        self._reward_shape: RewardShape = reward_shape
 
         self.observation_space = observation_space()
         self.action_space = spaces.Discrete(MAX_ACTIONS)
@@ -105,7 +108,7 @@ class UsiecCepraEnv(Env[dict[str, np.ndarray], int]):
         done = bool(self._last_obs.get("done"))
         truncated = (not done) and self._step_count >= self._max_episode_steps
         outcome = self._last_obs.get("outcome")
-        reward = 1.0 if done and outcome == "player_win" else 0.0
+        reward = self._compute_reward(done, outcome, self._last_obs)
 
         info: dict[str, Any] = {}
         if done or truncated:
@@ -119,6 +122,21 @@ class UsiecCepraEnv(Env[dict[str, np.ndarray], int]):
                     info["summary"] = fallback.get("summary")
 
         return encode(self._last_obs), reward, done, truncated, info
+
+    def _compute_reward(
+        self,
+        done: bool,
+        outcome: str | None,
+        obs: EngineObservation,
+    ) -> float:
+        if not done:
+            return 0.0
+        is_win = 1.0 if outcome == "player_win" else 0.0
+        if self._reward_shape == "none":
+            return is_win
+        floor = float(obs.get("floor", 0) or 0)
+        floor_progress = min(1.0, max(0.0, floor / 15.0))
+        return 0.1 * floor_progress + 0.9 * is_win
 
     def action_masks(self) -> np.ndarray:
         """Return current legal-action mask for sb3-contrib MaskablePPO."""

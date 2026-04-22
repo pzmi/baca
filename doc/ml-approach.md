@@ -48,6 +48,20 @@ with the shaping term paid **only on termination**, not per-step. Per-step
 rewards risk biasing the policy toward short-term plays that sacrifice
 long-term deck-building.
 
+### Iteration-2 update
+
+Iteration-2 promotes the floor-based shaping to the default (`--reward-shape floor`),
+still paid only on termination. Rationale: v0 training produced zero wins over 100k
+steps; the value function had no signal to fit on ~96% zero-reward episodes, and the
+research brief (`/.claude/research-brief-v2.md` §2 Tier-2(D)) flags sparse-reward
+credit-assignment collapse as the root cause. Floor-progress shaping gives the critic
+a graded target without introducing the per-step bias we were worried about in v0.
+Truncations still pay zero reward — they are not terminal win/loss states.
+
+If the shaped policy stalls at high survival / low wins (e.g. `avg_floor` improves
+but winrate stays near zero), revert to `--reward-shape none` and revisit the
+encoder or move to BC warm start.
+
 ## Hyperparameters (starting point)
 
 ```
