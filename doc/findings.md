@@ -104,3 +104,29 @@ Implication for iter-3: do not drop shaping when adding BC or larger networks; i
 ### PPO ceiling without a learning bootstrap
 
 Under the iter-2 build with floor shaping, the agent reaches `avg_floor 7.01` with `eval_mean_ep_length` climbing to 167 steps (vs v0's ~55) and `mean_reward` peaking at 0.0493 around step 100k before declining. Winrate across all 500 eval episodes is 0.0%. Pure on-policy PPO will not cross the 3.56% HeuristicBot baseline by just scaling timesteps: the policy is trading wins-potential for longer stalls. Next lever is behavior cloning from HeuristicBot as a warm start (`.claude/research-brief-v2.md` Tier-3(F)) — gives PPO non-zero wins to work with, then fine-tune.
+
+## Iter-3 empirical findings
+
+### Step 0 throughput (BACA-side HeuristicBot collection)
+
+20-game benchmark via `python -m baca.bc.benchmark --games 20` — one `RpcClient` + one `HeuristicBridge` subprocess over stdio, sequentially:
+
+```
+avg_steps_per_game: 61.5
+p50 rpc_ms: 0.06
+p95 rpc_ms: 0.11
+p50 heuristic_ms: 0.10
+p95 heuristic_ms: 0.14
+games_per_sec: 74.71
+projected_wall_clock_50k_games: 0.19 h
+```
+
+Two surprises versus the research brief. First, decision steps per game are ~2.5× the brief's 25-step assumption — 61.5 measured, matching the 63 seen at `n=2`. The brief cross-referenced this file's iter-2 line ("~25 actions per game"), but that number is engine-side `applyAction` calls per HeuristicBot game; BACA's decision loop also stops at intermediate-reward phases (card picks, shop turns, rest choices), so the Python-side step count is legitimately higher. Second, collection is ~100× faster than the brief's upper bound — 50k games projects to ~11 minutes sequentially, not 20-25 hours. The RPC + stdio handoff is ~0.2ms per action, not the ~1-2s/game the brief assumed from "RPC-heavy Python."
+
+Implications for iter-3:
+
+- 50k games × 61.5 steps ≈ **3.1M samples**, between the plan's 1.25M and 5M envelope rows. Plan §3 Reconciliation 2's "5M / 3 epochs / batch 256 / lr 1e-3" recipe is the closer fit.
+- Sequential collection is the baseline; parallelization (plan R3, §5 Step 6) is not needed.
+- Wall-clock is dominated by BC training (~30-90 min CPU) and PPO fine-tune (~15-25 min), not data collection.
+
+Benchmark output preserved in `logs/bench_step0.out`.
