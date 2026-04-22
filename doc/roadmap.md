@@ -38,13 +38,22 @@ Focus:
 
 **Goal:** Match or exceed 3.56% winrate and 10.2 avg floor.
 
-Experiments (in priority order):
+### Landed (iter-1, iter-2)
 
-1. **Reward shaping** — add `0.1 * (floor / 15)` at termination.
-2. **Vectorization** — `SubprocVecEnv` with 8–16 envs (4 RPC processes × 4 runs each).
-3. **Larger network** — widen MLP to 256/256 or add a small transformer over the hand encoding.
-4. **LSTM policy** — `RecurrentPPO` from `sb3-contrib` to model partial observability (hidden deck order, future draws).
-5. **Card-identity embedding** — replace the type-only encoding with a learned embedding over card IDs.
+- **Vectorization** (iter-1). `SubprocVecEnv` with 8 envs, one `RpcClient` per worker. Default in `train.py`.
+- **Reward shaping** (iter-2). Floor-based terminal shaping `0.1 * (floor / 15) + 0.9 * is_win`, opt-in via `--reward-shape floor` (default on). Terminal-only reproduced by `--reward-shape none`.
+- **Card-identity embedding** (iter-2, commit `3ed4d58`). `CARD_IDS` append-only tuple (67 engine ids + `UNKNOWN` sentinel) feeding a shared `nn.Embedding(D=32)`. `MaskableBacaPolicy` + `BacaFeaturesExtractor` apply masked single-head attention pooling over hand, shop, and reward card slots.
+- **Attention-pool init + terminal-ReLU bugs** (iter-2). Both discovered and fixed during validation — see `doc/findings.md`.
+
+### Outcome so far
+
+200k-step training with the iter-2 encoder + floor shaping reaches **avg_floor 7.01** (HeuristicBot 10.23) with `eval_mean_ep_length` 167 and `explained_variance` stably positive, but **winrate still 0.0%** over 500 seeded eval episodes. The policy survives much longer than v0 (8.06 floor, ~55 steps) without converting survival into wins. Pure PPO has hit the sparse-reward ceiling: critic fits the shaped return but the policy never observes a reward above 0.1 so there is no gradient separating "survive to floor 7" from "win the run."
+
+### Remaining (iter-3+)
+
+1. **Behavior cloning warm start from HeuristicBot.** Prescribed next lever per `.claude/research-brief-v2.md`: collect ~50k HeuristicBot games with the iter-2 observation shape, pretrain the policy by cross-entropy against HeuristicBot actions, then PPO fine-tune. Bootstrap breaks the cold-start sparse-reward trap. Caps at the HeuristicBot ceiling on its own — must be paired with PPO fine-tuning to exceed 3.56%.
+2. **Larger network.** Widen the extractor projection to `features_dim=128` and/or `net_arch=[128, 128]` on the policy head. Deferred — at iter-2 capacities the critic overfits under sparse reward; more parameters before the BC anchor likely makes this worse, not better.
+3. **LSTM policy.** `RecurrentPPO` from `sb3-contrib` to model partial observability (hidden deck order, future draws). Deferred until BC lifts winrate off zero — history stacking buys nothing while the policy cannot close out a run.
 
 **Done when:** Paired eval over 1000 seeds shows BACA winrate confidence
 interval overlapping or exceeding HeuristicBot's.

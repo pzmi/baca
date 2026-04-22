@@ -71,3 +71,36 @@ From `slay-the-ceper/baselines/main.metrics.json` (9998 games, Jędrek, normal):
 - avg HP at death: **0.53** (fraction of max)
 
 BACA's target for phase 2 is to match these; phase 3 to double them.
+
+## Iter-2 empirical findings
+
+### Engine caps reward and shop card offers at 3, not 5
+
+`src/state/ShopSystem.js:99` calls `_pickUniqueItems(cardPool, cardLibrary, 3)`; `src/engine/ActionDispatcher.js:260` calls `generateCardRewardChoices?.(3)`. `MAX_REWARD_CARDS = MAX_SHOP_CARDS = 3` in the encoder. Widening either requires an engine change first, otherwise the extra slots stay permanently zero-padded and eat policy capacity.
+
+### Attention-pool double-scaling silently collapses softmax
+
+A single-head attention pool implemented as `query = nn.Parameter(randn(D) / sqrt(D))` *and* `logits = (keys @ query) / sqrt(D)` stacks two `1/sqrt(D)` factors. Effective logit std lands at `≈ 1/D`; softmax over 3-10 slots is indistinguishable from uniform (hand block measured 1.05× uniform max weight at init). The pool behaves as a mean-pool with zero query gradient throughout early training — value function can fit the shaped signal but the attention query never learns *which* card matters.
+
+Diagnosis tools that caught it: forward the pool with `torch.manual_seed(0)` on a synthetic batch and assert `max_weight > 1.2 × uniform` and `std > 0.05`. Fix: drop the explicit `1/sqrt(D)` scale and init the query with plain `randn(D)` (std=1). After the fix, hand block weights peak at ~7.9× uniform and queries receive usable gradient from step 1. Regression-pinned by `test_shouldProduceNonUniformAttentionWeightsAtInit` in `tests/unit/test_policy.py`.
+
+### Terminal `nn.ReLU` on a features extractor wastes half the policy-head input space
+
+Stable-Baselines3 initializes `MaskableMultiInputActorCriticPolicy`'s policy and value heads with `ortho_init=True` (orthogonal gain ~ √2 for hidden layers, ~0.01 for the policy output). If the features extractor ends in `nn.ReLU`, the extractor output lives in `R^features_dim_+`; the orthogonally-initialized head sees only positive inputs, cutting effective input dim roughly in half and biasing head outputs. Symptom: training runs with `explained_variance` climbing positive early then collapsing to large negatives (measured -12 to -34 at 200k under `shape=none`). Fix: make the last layer of the extractor a plain `nn.Linear` so features can take negative values. Sentinel: `test_shouldProduceNegativeFeatureValuesWhenForwardAllowsSignedActivations`.
+
+### Floor shaping is the stable signal; terminal-only collapses the critic
+
+Same iter-2 build (fixed init, no terminal ReLU), same 200k steps, same seed, only the reward toggled:
+
+| `--reward-shape` | avg_floor (best) | explained_variance at 200k | eval_mean_ep_length |
+|:-----------------|:-----------------|:---------------------------|:--------------------|
+| `floor`          | **7.01**         | **+0.61** (stable)         | 167                 |
+| `none`           | 2.00             | -12.1                      | 33.5                |
+
+With a working encoder the shaping is the single change that lets the critic fit a target at all. Terminal-only under the new encoder gets no wins, the value function sees near-zero returns everywhere, and the larger observation space (int ids + masks + costs for three blocks) gives it more dimensions to overfit noise with.
+
+Implication for iter-3: do not drop shaping when adding BC or larger networks; it is load-bearing until the policy crosses into positive winrates.
+
+### PPO ceiling without a learning bootstrap
+
+Under the iter-2 build with floor shaping, the agent reaches `avg_floor 7.01` with `eval_mean_ep_length` climbing to 167 steps (vs v0's ~55) and `mean_reward` peaking at 0.0493 around step 100k before declining. Winrate across all 500 eval episodes is 0.0%. Pure on-policy PPO will not cross the 3.56% HeuristicBot baseline by just scaling timesteps: the policy is trading wins-potential for longer stalls. Next lever is behavior cloning from HeuristicBot as a warm start (`.claude/research-brief-v2.md` Tier-3(F)) — gives PPO non-zero wins to work with, then fine-tune.
