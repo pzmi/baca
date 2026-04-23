@@ -175,3 +175,48 @@ Full log at `logs/step6.out`; checkpoint at `checkpoints/v3-bc/bc_model.zip`.
 `pred_mean ≈ returns_mean` — the critic is well-calibrated in expectation. `pred_std < returns_std` (0.017 vs 0.052 after epoch 2) means the value function smooths toward the mean return and does not yet discriminate states; this is the expected regime when ~99.5% of the terminal rewards are near-zero (2% winrate on a 3.2M-sample dataset). Good enough as a PPO bootstrap — plan §5 Step 8's `--initial-lr-scale 0.33 --clip-range 0.1` guards the first 20k-30k on-policy steps while the critic learns to discriminate from live rollouts.
 
 Checkpoint at `checkpoints/v3-bc-value/bc_value_model.zip`, full log at `logs/step7_value_pretrain.out`.
+
+### Step 8.5: PPO fine-tune from BC warm-start
+
+Two runs, both 200k timesteps / 8 envs / seed 42 / `--reward-shape floor --gamma 0.99 --ent-coef 0.01 --initial-lr-scale 0.33 --warmup-frac 0.1 --clip-range 0.1`:
+
+- `checkpoints/v3-bcppo/` — `--bc-init checkpoints/v3-bc/bc_model.zip` → wall-clock 3m39s.
+- `checkpoints/v3-bcppo-valuewarm/` — `--bc-init checkpoints/v3-bc-value/bc_value_model.zip` → wall-clock 3m31s.
+
+Eval-during-training (20 episodes every 10k steps) mean-reward trace stayed in `[0.04, 0.06]` band for both runs after the first eval. One BC+value eval at step 110k spiked to 0.09 ± 0.21 — consistent with a single win among the 20 episodes, not a stable lift. Best-mean-reward trigger fired early in both runs (by step 30k for BC-only, by step 30k for BC+value) and then stopped improving, so `best_model.zip` in each dir is an early-training snapshot, not an end-of-training one.
+
+Diagnostic gap — SB3's `.learn()` output didn't capture `explained_variance` in stdout (EvalCallback-only path). Plan §5 Step 8 asked for the first-10k-step EV check; tensorboard logs at `checkpoints/tensorboard/MaskablePPO_3/` preserve them for post-hoc audit, but the 500-episode A/B below tells the outcome regardless.
+
+### Step 9: 500-episode paired-seed A/B
+
+All four checkpoints evaluated at `--base-seed 99999` so seeds 99999-100498 are identical across configurations:
+
+| Checkpoint            | episodes | winrate   | avg_floor | max_floor |
+|:----------------------|:---------|:----------|:----------|:----------|
+| v2-norelu-shaped      | 500      | 0.00%     | 7.01      | 15        |
+| **v3-bc (BC-only)**   | 500      | **1.20%** | **8.02**  | 15        |
+| v3-bcppo (BC→PPO)     | 500      | 0.60%     | 7.58      | 15        |
+| v3-bcppo-valuewarm    | 500      | 0.00%     | 7.33      | 15        |
+| HeuristicBot baseline | 9998     | 3.56%     | 10.23     | 15        |
+
+Full log at `logs/step9_eval_ab.out`.
+
+### Iter-3 verdict — BC helps, PPO warm-start regresses it
+
+BC-only cleared the plan §1 red-regression gate (winrate < 1% AND avg_floor < 5) but not the acceptance bar (winrate ≥ 4% AND avg_floor ≥ 10) or the green-but-below-exit fallback ([3.56%, 4%] AND avg_floor ≥ 9). The empirical result: BC imitation over 50k HeuristicBot games lifts avg_floor by +1.01 and produces the first nonzero winrate (0% → 1.2%, 6 wins in 500 seeds), but both configurations of PPO fine-tune *erase* that lift — BC→PPO drops to 0.6% / 7.58, BC+value→PPO drops to 0.0% / 7.33. PPO moved the policy off the BC plateau into worse territory for this architecture and dataset.
+
+Likely failure modes, ranked by suspect:
+
+1. **Sparse-reward policy drift.** 98.8% of BC states end in losses with terminal reward ≈ `0.1 * floor/15` ∈ [0, 0.1]. PPO's advantage estimates at that reward scale are small and noisy; the clipped ratio guardrail (clip=0.1) constrains per-step change but 200k timesteps (~6.2k clipped updates at n_steps=2048, n_epochs=10) still accumulate into a different attractor than BC's 71.8%-imitation manifold.
+2. **Critic underfit at start.** Step 7's value pretrain converged to `pred_std = 0.017 < returns_std = 0.052` — the critic was essentially constant at the mean return. PPO's first real advantages (from live rollouts where outcomes differ floor-to-floor) will have been large relative to that critic, and the critic has to relearn discrimination while the policy is also drifting.
+3. **Architecture ceiling.** 71.8% BC holdout accuracy might be the best this encoder can do on HeuristicBot's greedy decision tree. If so, PPO cannot lift past what the representation supports regardless of hyperparameters — iter-4 would need a larger embedding, history / LSTM, or direct MCTS-style lookahead.
+4. **Hyperparameter miscalibration.** 200k timesteps may be too long at this lr + clip-range combination. A shorter run (50k timesteps) or tighter clip (0.05) might preserve the BC gain while still exploring for wins. Worth trying before iter-4.
+
+Plan §1's "green-but-below-exit fallback" text applies exactly: "BC warm start is useful but not enough, go iter-4." Iter-3 ships `checkpoints/v3-bc/bc_model.zip` as the new best artifact (1.2% / 8.02) superseding iter-2's 0% / 7.01. PPO fine-tune is deprecated for this architecture until iter-4 tunes it (or replaces the policy class). `doc/roadmap.md` updated accordingly.
+
+Iter-4 candidates, ordered by expected-value-per-effort:
+
+1. Shorter PPO fine-tune (50k timesteps, tighter clip 0.05) — cheap A/B against iter-3's BC-only 1.2% baseline.
+2. Larger BC dataset (100-200k games) — throughput is 29 g/s sustained, so 200k games ≈ 2h. Diminishing returns likely past 100k.
+3. Architecture: history stacking or a 2-layer LSTM over the attention-pooled features — addresses partial-observability mentioned in §Gotchas above.
+4. Reward weighting — upsample winning trajectories during BC training to bias the imitation toward wins; doesn't require new data.
