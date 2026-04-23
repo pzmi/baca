@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from baca.train import TrainConfig, _linear_schedule, _parse_args
+from gymnasium import spaces
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+from baca.bc.trainer import _DummyEnv, build_bc_policy, save_bc_checkpoint
+from baca.encoder import MAX_ACTIONS, observation_space
+from baca.train import (
+    TrainConfig,
+    _linear_schedule,
+    _load_bc_model,
+    _parse_args,
+    _warmup_schedule,
+)
 
 
 def test_shouldReturnStartRateWhenProgressRemainingIsOne() -> None:
@@ -211,3 +223,193 @@ def test_shouldParseCardEmbedDimWhenFlagProvided() -> None:
     # then
     assert cfg.card_embed_dim == 48
     assert cfg.features_dim == 96
+
+
+def test_shouldParseBcInitPathWhenFlagProvided() -> None:
+    # given
+    argv = ["--bc-init", "foo.zip"]
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.bc_init == Path("foo.zip")
+
+
+def test_shouldDefaultBcInitToNoneWhenFlagOmitted() -> None:
+    # given
+    argv: list[str] = []
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.bc_init is None
+
+
+def test_shouldDefaultInitialLrScaleToOneWhenNotProvided() -> None:
+    # given
+    argv_with_bc = ["--bc-init", "foo.zip"]
+    argv_without_bc: list[str] = []
+
+    # when
+    cfg_with_bc = _parse_args(argv_with_bc)
+    cfg_without_bc = _parse_args(argv_without_bc)
+
+    # then
+    assert cfg_with_bc.initial_lr_scale == 1.0
+    assert cfg_without_bc.initial_lr_scale == 1.0
+
+
+def test_shouldParseWarmupFracWhenFlagProvided() -> None:
+    # given
+    argv = ["--warmup-frac", "0.25", "--initial-lr-scale", "0.33"]
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.warmup_frac == 0.25
+    assert cfg.initial_lr_scale == 0.33
+
+
+def test_shouldDefaultWarmupFracToPointOneWhenFlagOmitted() -> None:
+    # given
+    argv: list[str] = []
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.warmup_frac == 0.1
+
+
+def test_shouldDefaultResetNumTimestepsTrueWhenFlagOmitted() -> None:
+    # given
+    argv: list[str] = []
+
+    # when
+    cfg = _parse_args(argv)
+
+    # then
+    assert cfg.reset_num_timesteps is True
+
+
+def test_shouldPassThroughResetNumTimestepsWhenFlagSet() -> None:
+    # given
+    argv_reset = ["--reset-num-timesteps"]
+    argv_no_reset = ["--no-reset-num-timesteps"]
+
+    # when
+    cfg_reset = _parse_args(argv_reset)
+    cfg_no_reset = _parse_args(argv_no_reset)
+
+    # then
+    assert cfg_reset.reset_num_timesteps is True
+    assert cfg_no_reset.reset_num_timesteps is False
+
+
+def test_shouldReturnBaseScheduleWhenInitialScaleIsOne() -> None:
+    # given
+    base = _linear_schedule(3e-4, 1e-4)
+    warmup = _warmup_schedule(3e-4, 1e-4, warmup_frac=0.1, initial_scale=1.0)
+
+    # when / then
+    for p in (1.0, 0.9, 0.5, 0.1, 0.0):
+        assert warmup(p) == base(p)
+
+
+def test_shouldReturnBaseScheduleWhenWarmupFracIsZero() -> None:
+    # given
+    base = _linear_schedule(3e-4, 1e-4)
+    warmup = _warmup_schedule(3e-4, 1e-4, warmup_frac=0.0, initial_scale=0.33)
+
+    # when / then
+    for p in (1.0, 0.9, 0.5, 0.1, 0.0):
+        assert warmup(p) == base(p)
+
+
+def test_shouldWarmupScheduleReducesLRWhenCalledEarly() -> None:
+    # given
+    lr_start = 3e-4
+    lr_final = 1e-4
+    warmup_frac = 0.1
+    initial_scale = 0.33
+    base = _linear_schedule(lr_start, lr_final)
+    schedule = _warmup_schedule(lr_start, lr_final, warmup_frac, initial_scale)
+
+    # when / then
+    # Start of training: full warmup scaling applied to the base rate.
+    assert schedule(1.0) == initial_scale * base(1.0)
+    # End of warmup window: scaling factor has interpolated to 1.0.
+    assert abs(schedule(1.0 - warmup_frac) - base(1.0 - warmup_frac)) < 1e-12
+    # End of training: base schedule (unchanged).
+    assert schedule(0.0) == base(0.0)
+    # Past warmup window: base schedule applies.
+    assert schedule(0.5) == base(0.5)
+
+
+def test_shouldInterpolateScaleLinearlyAcrossWarmupWindow() -> None:
+    # given
+    base = _linear_schedule(1.0, 1.0)  # flat base so only the scale is visible
+    schedule = _warmup_schedule(1.0, 1.0, warmup_frac=0.1, initial_scale=0.5)
+
+    # when
+    midpoint = schedule(0.95)  # halfway through the 0.1-wide warmup window
+
+    # then
+    # scale interpolates from 0.5 (at p=1.0) to 1.0 (at p=0.9), so midpoint = 0.75.
+    assert abs(midpoint - 0.75 * base(0.95)) < 1e-12
+
+
+def test_shouldOverrideHyperparamsFromConfigWhenLoadingBcCheckpoint(tmp_path: Path) -> None:
+    # given — BC checkpoint saved via the trainer's transient MaskablePPO,
+    # which pins ent_coef=0, n_epochs=1, n_steps=8, batch_size=8.
+    obs_space = observation_space()
+    act_space: spaces.Space[int] = spaces.Discrete(MAX_ACTIONS)
+    policy = build_bc_policy(obs_space, act_space)
+    ckpt_path = tmp_path / "bc.zip"
+    save_bc_checkpoint(policy, obs_space, act_space, ckpt_path)
+    vec_env = DummyVecEnv([lambda: _DummyEnv(obs_space, act_space)])
+    cfg = TrainConfig(
+        total_timesteps=1,
+        character_id="jedrek",
+        difficulty="normal",
+        base_seed=None,
+        checkpoint_dir=tmp_path / "run",
+        engine_dir=None,
+        learning_rate=3e-4,
+        n_steps=1024,
+        batch_size=64,
+        ent_coef=0.01,
+        n_epochs=10,
+        gamma=0.97,
+        gae_lambda=0.93,
+        clip_range=0.1,
+        bc_init=ckpt_path,
+        initial_lr_scale=0.33,
+        warmup_frac=0.1,
+    )
+
+    # when
+    try:
+        model = _load_bc_model(cfg, vec_env)
+
+        # then — scalar hyperparams match the config, not the BC-transient defaults.
+        assert model.ent_coef == 0.01
+        assert model.n_epochs == 10
+        assert model.n_steps == 1024
+        assert model.batch_size == 64
+        assert model.gamma == 0.97
+        assert model.gae_lambda == 0.93
+        # Rollout buffer was rebuilt to match n_steps/gamma/gae_lambda.
+        assert model.rollout_buffer.buffer_size == 1024
+        assert model.rollout_buffer.gamma == 0.97
+        assert model.rollout_buffer.gae_lambda == 0.93
+        assert model.rollout_buffer.n_envs == vec_env.num_envs
+        # LR + clip-range overrides from custom_objects still applied.
+        assert abs(model.lr_schedule(1.0) - 0.33 * 3e-4) < 1e-12
+        clip_range_fn: Callable[[float], float] = model.clip_range  # type: ignore[assignment]
+        assert clip_range_fn(1.0) == 0.1
+    finally:
+        vec_env.close()

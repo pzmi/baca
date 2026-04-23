@@ -56,6 +56,10 @@ class TrainConfig:
     reward_shape: str = "floor"
     card_embed_dim: int = 32
     features_dim: int = 64
+    bc_init: Path | None = None
+    initial_lr_scale: float = 1.0
+    warmup_frac: float = 0.1
+    reset_num_timesteps: bool = True
 
 
 def _linear_schedule(start: float, end: float) -> Callable[[float], float]:
@@ -63,6 +67,39 @@ def _linear_schedule(start: float, end: float) -> Callable[[float], float]:
 
     def schedule(progress_remaining: float) -> float:
         return end + (start - end) * progress_remaining
+
+    return schedule
+
+
+def _warmup_schedule(
+    lr_start: float,
+    lr_final: float,
+    warmup_frac: float,
+    initial_scale: float,
+) -> Callable[[float], float]:
+    """Linear LR schedule with an early warmup window scaled by ``initial_scale``.
+
+    Within the first ``warmup_frac`` of training (progress_remaining in
+    ``[1 - warmup_frac, 1.0]``), the base schedule is multiplied by a factor
+    that interpolates from ``initial_scale`` at the start to ``1.0`` at the end
+    of warmup. After warmup the base schedule applies verbatim. Degenerates to
+    ``_linear_schedule`` when ``initial_scale == 1.0`` or ``warmup_frac == 0``.
+    """
+    base = _linear_schedule(lr_start, lr_final)
+    if initial_scale == 1.0 or warmup_frac <= 0.0:
+        return base
+
+    warmup_cutoff = 1.0 - warmup_frac
+
+    def schedule(progress_remaining: float) -> float:
+        base_lr = base(progress_remaining)
+        if progress_remaining <= warmup_cutoff:
+            return base_lr
+        # t = 0 at start of training (progress_remaining == 1.0);
+        # t = 1 at end of warmup (progress_remaining == warmup_cutoff).
+        t = (1.0 - progress_remaining) / warmup_frac
+        scale = initial_scale + (1.0 - initial_scale) * t
+        return scale * base_lr
 
     return schedule
 
@@ -136,6 +173,52 @@ def _build_eval_vec_env(cfg: TrainConfig) -> VecEnv:
     return DummyVecEnv([eval_thunk])
 
 
+def _load_bc_model(cfg: TrainConfig, vec_env: VecEnv) -> MaskablePPO:
+    """Load a BC checkpoint as MaskablePPO and overwrite transient hyperparams.
+
+    ``MaskablePPO.load`` restores every scalar attribute from the zip's pickled
+    ``data`` dict. The BC checkpoint was saved via a transient MaskablePPO with
+    ``n_steps=8``, ``batch_size=8``, ``n_epochs=1``, ``ent_coef=0.0`` — none of
+    which the caller wants during fine-tuning. We override via ``custom_objects``
+    for callables (LR + clip-range schedules) and reassign scalar attributes
+    post-load. ``n_steps`` changes also require a fresh rollout buffer since
+    SB3 materializes it eagerly at load time.
+    """
+    lr_schedule = _warmup_schedule(
+        cfg.learning_rate, cfg.lr_final, cfg.warmup_frac, cfg.initial_lr_scale
+    )
+    clip_range_schedule = _linear_schedule(cfg.clip_range, cfg.clip_range)
+    model = MaskablePPO.load(
+        str(cfg.bc_init),
+        env=vec_env,
+        custom_objects={
+            "learning_rate": lr_schedule,
+            "lr_schedule": lr_schedule,
+            "clip_range": clip_range_schedule,
+        },
+    )
+    model.ent_coef = cfg.ent_coef
+    model.n_epochs = cfg.n_epochs
+    model.n_steps = cfg.n_steps
+    model.batch_size = cfg.batch_size
+    model.gamma = cfg.gamma
+    model.gae_lambda = cfg.gae_lambda
+    # Rebuild the rollout buffer so n_steps / gamma / gae_lambda actually take
+    # effect; SB3 instantiates it inside _setup_model() based on the saved
+    # scalars and we just overwrote those.
+    buffer_cls = type(model.rollout_buffer)
+    model.rollout_buffer = buffer_cls(
+        cfg.n_steps,
+        model.observation_space,
+        model.action_space,
+        model.device,
+        gamma=cfg.gamma,
+        gae_lambda=cfg.gae_lambda,
+        n_envs=vec_env.num_envs,
+    )
+    return model
+
+
 def train(cfg: TrainConfig) -> Path:
     cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     train_env = _build_train_vec_env(cfg)
@@ -147,22 +230,27 @@ def train(cfg: TrainConfig) -> Path:
             "card_embed_dim": cfg.card_embed_dim,
             "features_dim": cfg.features_dim,
         }
-        model = MaskablePPO(
-            MaskableBacaPolicy,
-            train_env,
-            learning_rate=_linear_schedule(cfg.learning_rate, cfg.lr_final),
-            n_steps=cfg.n_steps,
-            batch_size=cfg.batch_size,
-            n_epochs=cfg.n_epochs,
-            gamma=cfg.gamma,
-            gae_lambda=cfg.gae_lambda,
-            clip_range=cfg.clip_range,
-            ent_coef=cfg.ent_coef,
-            seed=cfg.seed,
-            verbose=1,
-            tensorboard_log=str(cfg.checkpoint_dir / "tensorboard"),
-            policy_kwargs=policy_kwargs,
-        )
+        if cfg.bc_init is not None:
+            model = _load_bc_model(cfg, train_env)
+        else:
+            model = MaskablePPO(
+                MaskableBacaPolicy,
+                train_env,
+                learning_rate=_warmup_schedule(
+                    cfg.learning_rate, cfg.lr_final, cfg.warmup_frac, cfg.initial_lr_scale
+                ),
+                n_steps=cfg.n_steps,
+                batch_size=cfg.batch_size,
+                n_epochs=cfg.n_epochs,
+                gamma=cfg.gamma,
+                gae_lambda=cfg.gae_lambda,
+                clip_range=cfg.clip_range,
+                ent_coef=cfg.ent_coef,
+                seed=cfg.seed,
+                verbose=1,
+                tensorboard_log=str(cfg.checkpoint_dir / "tensorboard"),
+                policy_kwargs=policy_kwargs,
+            )
 
         eval_cb = MaskableEvalCallback(
             eval_env,
@@ -180,7 +268,11 @@ def train(cfg: TrainConfig) -> Path:
         )
         callback = CallbackList([eval_cb, ckpt_cb])
 
-        model.learn(total_timesteps=cfg.total_timesteps, callback=callback)
+        model.learn(
+            total_timesteps=cfg.total_timesteps,
+            callback=callback,
+            reset_num_timesteps=cfg.reset_num_timesteps,
+        )
         out_path = cfg.checkpoint_dir / "baca-latest.zip"
         model.save(str(out_path))
         return out_path
@@ -226,6 +318,37 @@ def _parse_args(argv: list[str] | None = None) -> TrainConfig:
     )
     parser.add_argument("--card-embed-dim", type=int, default=32)
     parser.add_argument("--features-dim", type=int, default=64)
+    parser.add_argument(
+        "--bc-init",
+        type=Path,
+        default=None,
+        help="Path to a MaskablePPO-compatible BC checkpoint to warm-start from.",
+    )
+    parser.add_argument(
+        "--initial-lr-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to the LR schedule during the first --warmup-frac of training.",
+    )
+    parser.add_argument(
+        "--warmup-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of total_timesteps over which the initial-lr-scale interpolates to 1.0.",
+    )
+    parser.add_argument(
+        "--reset-num-timesteps",
+        dest="reset_num_timesteps",
+        action="store_true",
+        help="Reset model.num_timesteps at .learn() start (SB3 default).",
+    )
+    parser.add_argument(
+        "--no-reset-num-timesteps",
+        dest="reset_num_timesteps",
+        action="store_false",
+        help="Preserve model.num_timesteps across .learn() calls.",
+    )
+    parser.set_defaults(reset_num_timesteps=True)
     args = parser.parse_args(argv)
     return TrainConfig(
         total_timesteps=args.total_timesteps,
@@ -251,6 +374,10 @@ def _parse_args(argv: list[str] | None = None) -> TrainConfig:
         reward_shape=args.reward_shape,
         card_embed_dim=args.card_embed_dim,
         features_dim=args.features_dim,
+        bc_init=args.bc_init,
+        initial_lr_scale=args.initial_lr_scale,
+        warmup_frac=args.warmup_frac,
+        reset_num_timesteps=args.reset_num_timesteps,
     )
 
 
